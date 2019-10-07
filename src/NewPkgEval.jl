@@ -84,7 +84,7 @@ argument `ver` specifies the version of Julia to use, and `do_obtain` dictates w
 the specified version should first be downloaded. If `do_obtain` is `false`, it must
 already be installed.
 """
-function run_sandboxed_julia(args=``; ver::VersionNumber, do_obtain=true, kwargs...)
+function run_sandboxed_julia(args=``; ver::VersionNumber, do_obtain=true)
     if do_obtain
         obtain_julia(ver)
     else
@@ -96,7 +96,10 @@ function run_sandboxed_julia(args=``; ver::VersionNumber, do_obtain=true, kwargs
             installed_julia_dir(ver) => "/maps/julia",
             registry_path() => "/maps/registries/General"
         ])
-    BinaryBuilder.run_interactive(runner, `/maps/julia/bin/julia --color=yes $args`; kwargs...)
+
+    #BinaryBuilder.run_interactive(runner, `/maps/julia/bin/julia --color=yes $args`; kwargs...)
+    cmd = `/maps/julia/bin/julia --color=yes $args`
+    return setenv(`$(runner.sandbox_cmd) -- $(cmd)`, runner.env)
 end
 
 log_path(ver) = joinpath(@__DIR__, "..", "logs/logs-$ver")
@@ -111,10 +114,9 @@ tests will cause the tests to fail. Test will be forcibly interrupted after `tim
 A log for the tests is written to a version-specific directory in the NewPkgEval root
 directory.
 """
-function run_sandboxed_test(pkg; ver::VersionNumber, do_depwarns=false, time_limit=60*45, kwargs...)
+function cmd_sandboxed_test(pkg::AbstractString; ver::VersionNumber, do_depwarns=false)
     @assert ispath(julia_path(ver))
     mkpath(log_path(ver))
-    log = joinpath(log_path(ver), "$pkg.log")
     arg = """
         using Pkg
         # TODO: Possible to remove?
@@ -131,20 +133,48 @@ function run_sandboxed_test(pkg; ver::VersionNumber, do_depwarns=false, time_lim
     """
     cmd = do_depwarns ? `--depwarn=error` : ``
     cmd = `$cmd -e $arg`
-    timed_out = false
-    open(log, "w") do f
-        try
-            t = @async run_sandboxed_julia(cmd; ver=ver, kwargs..., stdout=f, stderr=f)
-            Timer(time_limit) do timer
-                timed_out = true
-                try; schedule(t, InterruptException(); error=true); catch; end
-            end
-            wait(t)
-            return !timed_out
-        catch e
-            return false
+    return run_sandboxed_julia(cmd; ver=ver)
+end
+
+function run_sandboxed_test2(pkg::AbstractString; ver, time_limit = 45*60, kwargs...)
+    cmd = cmd_sandboxed_test(pkg; ver=ver, kwargs...)
+    p = Base.run(cmd; wait=false)
+    Timer(time_limit) do timer
+        @show process_running(p)
+        println("KILLING IT!!!!!!!!!!!!")
+        println("starting kill")
+        @show BinaryBuilder.runner_override
+        if BinaryBuilder.runner_override == "privileged"
+            print("sudo killing")
+            pid = getpid(p)
+            @show run(`sudo kill $pid`)
+        else
+            kill(p)
         end
+        println("finished kill")
     end
+    s = success(p)
+    return success(p)
+end
+
+function run_sandboxed_test(pkg::AbstractString; ver, time_limit = 45*60, kwargs...)
+    cmd = cmd_sandboxed_test(pkg; ver=ver, kwargs...)
+
+    #log = joinpath(log_path(ver), "$pkg.log")
+    #open(log, "w") do f
+        p = Base.run(pipeline(cmd, stdout=f); wait=false)
+
+        t = Timer(time_limit) do timer
+            @show process_running(p)
+            println("KILLING IT!!!!!!!!!!!!")
+            println("starting kill")
+            kill(p, 9)
+            println("finished kill")
+        end
+        wait(t)
+        @show success(p)
+        return success(p)
+    #end
 end
 
 # Skip these packages when testing packages
@@ -264,18 +294,18 @@ function run(pkgs, ninstances::Integer, ver::VersionNumber, result = Dict{String
                             println(io, "Worker $i: $(r) running for ", time)
                         end
                     end
-                    print(String(take!(io.io)))
+                    #print(String(take!(io.io)))
                     sleep(1)
                     CSI = "\e["
                     print(io, "$(CSI)$(ninstances+1)A$(CSI)1G$(CSI)0J")
                 end
                 stop_work()
             catch e
-                Base.@show e
                 stop_work()
                 !isa(e, InterruptException) && rethrow(e)
             end
         end
+        
         # Workers
         for i = 1:ninstances
             push!(all_workers, @async begin
@@ -284,12 +314,10 @@ function run(pkgs, ninstances::Integer, ver::VersionNumber, result = Dict{String
                         pkg = pop!(pkgs)
                         running[i] = Symbol(pkg.name)
                         times[i] = now()
-                        result[pkg.name] = run_sandboxed_test(pkg.name, do_depwarns=do_depwarns, ver=ver,
-                                                         time_limit = time_limit, do_obtain=false) ? :ok : :fail
+                        result[pkg.name] = NewPkgEval.run_sandboxed_test(pkg.name; ver=ver, time_limit=time_limit) ? :ok : :fail
                         running[i] = nothing
                     end
                 catch e
-                    @Base.show e
                     stop_work()
                     isa(e, InterruptException) || rethrow(e)
                 end
